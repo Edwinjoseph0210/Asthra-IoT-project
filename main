@@ -1,0 +1,234 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+#include <driver/i2s.h>
+#include "secret.h"   // WiFi credentials
+
+// ==== I2S Microphone Pin Mapping (INMP441) ====
+#define I2S_WS   25
+#define I2S_SCK  26
+#define I2S_SD   34
+
+#define I2S_PORT I2S_NUM_0
+#define BUFFER_SIZE 512
+#define SAMPLE_RATE 16000
+
+// ==== Relay Pins ====
+#define RELAY1_PIN 5
+#define RELAY2_PIN 2
+#define RELAY3_PIN 4
+
+// ==== Relay Thresholds & Hysteresis ====
+#define RELAY1_THRESHOLD 13
+#define RELAY2_THRESHOLD 15
+#define RELAY3_THRESHOLD 17
+#define HYSTERESIS 2
+
+// ==== PWM LED Pin & Settings ====
+#define PWM_PIN 14
+const int pwmFreq = 5000;
+const int pwmResolution = 8;  // 0–255
+
+// ==== Sensitivity Adjustment ====
+const int step_size = 250;
+const int max_value = 100;
+
+// ==== Relay States ====
+bool relay1State = false;
+bool relay2State = false;
+bool relay3State = false;
+
+// ==== Vibration Sensor (SW-420) ====
+#define VIB_PIN 32
+#define VIB_THRESHOLD 1   // digital trigger (LOW/HIGH)
+
+// ==== Web Server ====
+WebServer server(80);
+
+// ==== Globals for data ====
+int level = 0;
+bool vibrationDetected = false;
+
+// ==== Globals for IP print timing ====
+unsigned long lastIPPrint = 0;
+const unsigned long ipPrintInterval = 5000; // 5 seconds
+
+// ==== Setup I2S for INMP441 ====
+void setupI2SMic() {
+  const i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 4,
+    .dma_buf_len = 256
+  };
+
+  const i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_SCK,
+    .ws_io_num  = I2S_WS,
+    .data_out_num = -1,
+    .data_in_num  = I2S_SD
+  };
+
+  esp_err_t r = i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+  if (r != ESP_OK) Serial.println("ERROR: Failed to install I2S driver!");
+  r = i2s_set_pin(I2S_PORT, &pin_config);
+  if (r != ESP_OK) Serial.println("ERROR: Failed to set I2S pins!");
+
+  i2s_zero_dma_buffer(I2S_PORT);
+  Serial.println("I2S microphone initialized");
+}
+
+// ==== JSON API ====
+void handleJSON() {
+  StaticJsonDocument<256> doc;
+  doc["level"] = level;
+  doc["vibration"] = vibrationDetected;
+  doc["relay1"] = relay1State;
+  doc["relay2"] = relay2State;
+  doc["relay3"] = relay3State;
+  doc["ip"] = WiFi.localIP().toString();
+
+  String output;
+  serializeJson(doc, output);
+  server.send(200, "application/json", output);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Relays
+  pinMode(RELAY1_PIN, OUTPUT);
+  pinMode(RELAY2_PIN, OUTPUT);
+  pinMode(RELAY3_PIN, OUTPUT);
+  digitalWrite(RELAY1_PIN, LOW);
+  digitalWrite(RELAY2_PIN, LOW);
+  digitalWrite(RELAY3_PIN, LOW);
+
+  // PWM
+  if (!ledcAttach(PWM_PIN, pwmFreq, pwmResolution))
+    Serial.println("ERROR: PWM attach failed!");
+  else
+    Serial.println("PWM initialized");
+
+  // Vibration sensor
+  pinMode(VIB_PIN, INPUT);
+
+  // I2S mic
+  setupI2SMic();
+
+  // WiFi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println(" CONNECTED!");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+
+  // Web server
+  server.on("/data", handleJSON);
+  server.begin();
+  Serial.println("Web server started");
+}
+
+void loop() {
+  server.handleClient();
+
+  // ==== Print IP every 5s ====
+  if (millis() - lastIPPrint >= ipPrintInterval) {
+    lastIPPrint = millis();
+    Serial.print("ESP32 IP: ");
+    Serial.println(WiFi.localIP());
+  }
+
+  // ==== Vibration Sensor Read ====
+  int vibValue = digitalRead(VIB_PIN);
+  vibrationDetected = (vibValue == VIB_THRESHOLD);
+
+  // ==== Microphone Read ====
+  int32_t samples[BUFFER_SIZE];
+  size_t bytes_read = 0;
+
+  if (i2s_read(I2S_PORT, (char*)samples, sizeof(samples), &bytes_read, portMAX_DELAY) != ESP_OK || bytes_read == 0)
+    return;
+
+  int samples_read = bytes_read / sizeof(int32_t);
+  if (samples_read <= 0) return;
+
+  int64_t sum = 0;
+  for (int i = 0; i < samples_read; ++i) {
+    int32_t s = samples[i] >> 14;
+    sum += abs(s);
+  }
+
+  int64_t avg = sum / samples_read;
+  int rawLevel = avg / step_size;
+  if (rawLevel > max_value) rawLevel = max_value;
+  rawLevel = constrain(rawLevel, 0, 100);
+  level = rawLevel;
+
+  // ===== Relay Control (sound thresholds) =====
+  if (!relay1State && level > RELAY1_THRESHOLD) {
+    digitalWrite(RELAY1_PIN, HIGH);
+    relay1State = true;
+  } else if (relay1State && level < (RELAY1_THRESHOLD - HYSTERESIS)) {
+    digitalWrite(RELAY1_PIN, LOW);
+    relay1State = false;
+  }
+
+  if (!relay2State && level > RELAY2_THRESHOLD) {
+    digitalWrite(RELAY2_PIN, HIGH);
+    relay2State = true;
+  } else if (relay2State && level < (RELAY2_THRESHOLD - HYSTERESIS)) {
+    digitalWrite(RELAY2_PIN, LOW);
+    relay2State = false;
+  }
+
+  if (!relay3State && level > RELAY3_THRESHOLD) {
+    digitalWrite(RELAY3_PIN, HIGH);
+    relay3State = true;
+  } else if (relay3State && level < (RELAY3_THRESHOLD - HYSTERESIS)) {
+    digitalWrite(RELAY3_PIN, LOW);
+    relay3State = false;
+  }
+
+  // ===== PWM LED Brightness =====
+  int duty = 0;
+  if (vibrationDetected) {
+    duty = 255;  // vibration overrides → full brightness
+  } else {
+    if (level > 3 && !relay1State && !relay2State && !relay3State) {
+      duty = 50;   // low dimming
+    } else if (relay1State && !relay2State && !relay3State) {
+      duty = 128;  // medium when only Relay1 is ON
+    } else if (relay2State || relay3State) {
+      duty = 255;  // high when Relay2 or Relay3 is ON
+    } else {
+      duty = 0;    // off otherwise
+    }
+  }
+  ledcWrite(PWM_PIN, duty);
+
+  // ===== Debug =====
+  Serial.print("avg=");
+  Serial.print(avg);
+  Serial.print(" level=");
+  Serial.print(level);
+  Serial.print(" duty=");
+  Serial.print(duty);
+  Serial.print(" Vib=");
+  Serial.print(vibrationDetected ? "YES" : "NO");
+  Serial.print(" R1:");
+  Serial.print(relay1State ? "ON" : "OFF");
+  Serial.print(" R2:");
+  Serial.print(relay2State ? "ON" : "OFF");
+  Serial.print(" R3:");
+  Serial.println(relay3State ? "ON" : "OFF");
+}
